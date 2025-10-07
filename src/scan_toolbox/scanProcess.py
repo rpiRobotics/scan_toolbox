@@ -1,8 +1,4 @@
-import sys
-import matplotlib
-sys.path.append('../scan_tools/')
-from motoman_def import *
-from scan_utils import *
+from .scan_utils import *
 from robotics_utils import *
 from lambda_calc import *
 from general_robotics_toolbox import *
@@ -10,11 +6,8 @@ import open3d as o3d
 from sklearn.cluster import DBSCAN
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import colors
 import time
 from copy import deepcopy
-import colorsys
-import math
 
 class ScanProcess():
     def __init__(self,robot,positioner) -> None:
