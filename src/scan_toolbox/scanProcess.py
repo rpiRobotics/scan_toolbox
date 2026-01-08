@@ -764,14 +764,18 @@ class ScanProcess():
         # print("mti_pcd shape:",mti_pcd.shape)
         
         # cluster based noise remove
-        dbscan.fit(mti_pcd)
-        n_clusters_ = len(set(dbscan.labels_))
+        try:
+            dbscan.fit(mti_pcd)
+            n_clusters_ = len(set(dbscan.labels_))
 
-        if n_clusters_>1:
-            cluster_id = dbscan.labels_>=0
-            mti_pcd_noise_remove=mti_pcd[cluster_id]
-        else:
-            mti_pcd_noise_remove=mti_pcd
+            if n_clusters_>1:
+                cluster_id = dbscan.labels_>=0
+                mti_pcd_noise_remove=mti_pcd[cluster_id]
+            else:
+                mti_pcd_noise_remove=mti_pcd
+        except Exception as e:
+            print("DBSCAN failed:", e)
+            mti_pcd_noise_remove=None
 
         return mti_pcd_noise_remove
     
@@ -779,6 +783,8 @@ class ScanProcess():
         # TODO dh in different welding normal direction
 
         mti_pcd_noise_remove = self.scan2dDenoise(scan,crop_min=crop_min,crop_max=crop_max)
+        if mti_pcd_noise_remove is None:
+            return None,None,None,None
         
         # transform to R2TCP
         T_R2TCP_S1TCP=self.positioner.fwd(robot_q[6:],world=True).inv()*self.robot.fwd(robot_q[:6],world=True)
