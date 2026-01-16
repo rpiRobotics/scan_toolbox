@@ -886,7 +886,11 @@ class ScanProcess():
         crop_max = np.array(crop_max)
         crop_scanner_min = np.array(crop_scanner_min)
         crop_scanner_max = np.array(crop_scanner_max)
+        if Transz0_H is None:
+            Transz0_H = np.eye(4)
         Transz0_H_inv = np.linalg.inv(Transz0_H)
+        if last_height_profile is None:
+            last_height_profile = []
 
         pcd_track = None
         pcd_denoised_track = None
@@ -1044,6 +1048,12 @@ class ScanProcess():
 
     def get_scan2dhdw_data(self):
         try:
+            # sort the layer height and width track based on x position
+            self.layer_height_track = np.array(self.layer_height_track)
+            self.layer_width_track = np.array(self.layer_width_track)
+            self.layer_height_track = self.layer_height_track[np.argsort(self.layer_height_track[:,0])]
+            self.layer_width_track = self.layer_width_track[np.argsort(self.layer_width_track[:,0])]
+
             layer_height_profile = np.array(self.layer_height_track)
             layer_width_profile = np.array(self.layer_width_track)
             denoise_scan_dhdw = self.denoise_scan_dhdw
