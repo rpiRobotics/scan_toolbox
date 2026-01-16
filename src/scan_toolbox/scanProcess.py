@@ -899,7 +899,6 @@ class ScanProcess():
 
         while not self.end_scan2dhdw_thread_flag:
             try:
-
                 try:
                     pkt = self.raw_scan_dhdw_pipe.get(timeout=0.05)
                 except Empty:
@@ -910,6 +909,11 @@ class ScanProcess():
                 scan_data = pkt.scan_data
                 scan_stamp = pkt.stamp
                 robot_q = pkt.robot_q
+
+                if len(scan_data) == 0:
+                    continue
+                if len(robot_q) == 0:
+                    continue
 
                 scan_data = scan_data.T
                 scan_data = np.insert(scan_data,0,np.zeros(len(scan_data[0])),axis=0) # (3, N)
@@ -926,6 +930,7 @@ class ScanProcess():
                 scan_data_positioner = np.matmul(T_scanner_positioner.R,scan_data.T).T+T_scanner_positioner.p # (N,3)
                 # do Transz0_H transformation
                 scan_data_positioner = np.matmul(Transz0_H[:3,:3],scan_data_positioner.T).T+Transz0_H[:3,3]
+
                 in_region = (scan_data_positioner[:,0]>=crop_min[0]) & (scan_data_positioner[:,0]<=crop_max[0]) & \
                             (scan_data_positioner[:,1]>=crop_min[1]) & (scan_data_positioner[:,1]<=crop_max[1]) & \
                             (scan_data_positioner[:,2]>=crop_min[2]) & (scan_data_positioner[:,2]<=crop_max[2])
@@ -977,6 +982,7 @@ class ScanProcess():
 
                 # get interested region pcd for height and width calculation
                 curve_x_track = scan_x_positions - curve_direction*windows/2 if curve_direction>0 else scan_x_positions + curve_direction*windows/2
+                # print("track x:", curve_x_track)
                 # curve_x_track += shift_x
                 if curve_x_track < min(curve_x_start,curve_x_end) or curve_x_track > max(curve_x_start,curve_x_end):
                     continue
@@ -1002,7 +1008,9 @@ class ScanProcess():
                 if len(pcd_denoised_crop) == 0:
                     # print("No points in the crop for height calculation, skip...")
                     continue
-                highest_10_point_mean = np.mean(np.sort(pcd_denoised_crop[:,-1])[-10:])
+                highest_10_point_mean = np.nanmean(np.sort(pcd_denoised_crop[:,-1])[-10:])
+                if np.isnan(highest_10_point_mean):
+                    continue
                 self.layer_height_track.append([curve_x_track, highest_10_point_mean])
 
                 # find previous z height from last height profile
@@ -1030,11 +1038,13 @@ class ScanProcess():
                 end_time = time.perf_counter()
                 duration_list.append(end_time - start_time)
             except Exception as e:
+                # print(e)
                 continue
 
         print("Processed {} scans,".format(len(duration_list)))
-        print("(Mean,95%,Max) processing time per scan (s):", np.mean(duration_list), np.percentile(duration_list,95), np.max(duration_list))
-        print("(Mean,95%,Max) denoise time per scan (s):", np.mean(duration_denoise_list), np.percentile(duration_denoise_list,95), np.max(duration_denoise_list))
+        if len(duration_list)>0:
+            print("(Mean,95%,Max) processing time per scan (s):", np.mean(duration_list), np.percentile(duration_list,95), np.max(duration_list))
+            print("(Mean,95%,Max) denoise time per scan (s):", np.mean(duration_denoise_list), np.percentile(duration_denoise_list,95), np.max(duration_denoise_list))
 
     def scan2dhdw_push_data(self, scan_data, robot_q, scan_stamp):
         if not hasattr(self, 'end_scan2dhdw_thread_flag'):
