@@ -789,24 +789,38 @@ class ScanProcess():
         return mti_pcd_noise_remove
 
     def scan_denoise_thread(self,crop_min=[-40, 30],crop_max=[40, 200]):
+
+        try:
+            if self.end_scan2dhdw_thread_flag is False:
+                print("Please end scan2dhdw thread before starting denoise thread")
+                return
+        except AttributeError:
+            pass
+
         self.end_denoise_thread_flag = False
-        self.raw_scan_pipe = []
-        self.scan_stamps_pipe = []
         self.clear_denoised_scan_data()
+
+
         duration = []
         while not self.end_denoise_thread_flag:
-            if len(self.raw_scan_pipe)!=0:
-                time_start = time.time()
-                scan_data = self.raw_scan_pipe.pop(0)
-                stamp = self.scan_stamps_pipe.pop(0)
+            try:
+
+                try:
+                    pkt = self.raw_scan_denoise_pipe.get(timeout=0.05)
+                except Empty:
+                    continue
+
+                time_start = time.perf_counter()
+                scan_data = pkt.scan_data
+                stamp = pkt.stamp
                 scan_noise_remove = self.scan2dDenoise(scan_data.T, crop_min=crop_min, crop_max=crop_max)
                 if scan_noise_remove is not None:
                     self.denoise_stamps.append(stamp)
                     self.denoise_scans.append(scan_noise_remove)
 
-                duration.append(time.time()-time_start)
-            else:
-                time.sleep(0.0000000000001)
+                duration.append(time.perf_counter()-time_start)
+            except Exception:
+                continue
         print("Denoise thread duration:",np.mean(duration))
         print("Denoise thread duration max:",np.max(duration))
     
@@ -820,7 +834,18 @@ class ScanProcess():
             print("Get denoised scan data error:", e)
             return None,None
 
+    def scan_denoise_push_data(self, scan_data, robot_q, scan_stamp):
+        if not hasattr(self, 'end_denoise_thread_flag'):
+            print("Please start denoise thread before pushing data")
+            return
+        if self.end_denoise_thread_flag is True:
+            print("Please start denoise thread before pushing data")
+            return
+        pkt = ScanPacket(scan_data=scan_data, robot_q=np.asarray(robot_q), stamp=scan_stamp)
+        self.raw_scan_denoise_pipe.put(pkt)
+
     def clear_denoised_scan_data(self):
+        self.raw_scan_denoise_pipe = Queue(maxsize=200)
         self.denoise_scans = []
         self.denoise_stamps = []
 
@@ -1007,14 +1032,14 @@ class ScanProcess():
         print("(Mean,95%,Max) processing time per scan (s):", np.mean(duration_list), np.percentile(duration_list,95), np.max(duration_list))
         print("(Mean,95%,Max) denoise time per scan (s):", np.mean(duration_denoise_list), np.percentile(duration_denoise_list,95), np.max(duration_denoise_list))
 
-    def scan2dhdw_push_data(self, scan_data, robot_q, scan_stamps):
+    def scan2dhdw_push_data(self, scan_data, robot_q, scan_stamp):
         if not hasattr(self, 'end_scan2dhdw_thread_flag'):
             print("Please start scan2dhdw thread before pushing data")
             return
         if self.end_scan2dhdw_thread_flag:
             print("Please restart scan2dhdw thread before pushing data")
             return
-        pkt = ScanPacket(scan_data=scan_data, robot_q=np.asarray(robot_q), stamp=scan_stamps)
+        pkt = ScanPacket(scan_data=scan_data, robot_q=np.asarray(robot_q), stamp=scan_stamp)
         self.raw_scan_dhdw_pipe.put(pkt)  # blocks if queue is full (backpressure)
 
     def get_scan2dhdw_data(self):
