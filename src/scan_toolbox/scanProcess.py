@@ -8,6 +8,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 from copy import deepcopy
+from dataclasses import dataclass
+from queue import Queue, Empty
+
+@dataclass
+class ScanPacket:
+    scan_data: np.ndarray     # raw scan
+    robot_q: np.ndarray       # (>=8,)
+    stamp: float              # or np.ndarray / tuple, whatever you use
 
 class ScanProcess():
     def __init__(self,robot,positioner) -> None:
@@ -668,14 +676,15 @@ class ScanProcess():
             
             if type(z_height_start) is list or type(z_height_start) is np.ndarray:
                 # z height start is the last profile height
-                closest_id=np.where(z_height_start[:,0]>=x)[0]
-                if len(closest_id)==0:
-                    closest_id=-1
-                    this_z_height_start=z_height_start[-1,1]
-                else:
-                    closest_id=closest_id[0]
-                    ratio=(x-z_height_start[closest_id-1,0])/(z_height_start[closest_id,0]-z_height_start[closest_id-1,0])
-                    this_z_height_start=z_height_start[closest_id-1,1]+ratio*(z_height_start[closest_id,1]-z_height_start[closest_id-1,1])
+                # closest_id=np.where(z_height_start[:,0]>=x)[0]
+                # if len(closest_id)==0:
+                #     closest_id=-1
+                #     this_z_height_start=z_height_start[-1,1]
+                # else:
+                #     closest_id=closest_id[0]
+                #     ratio=(x-z_height_start[closest_id-1,0])/(z_height_start[closest_id,0]-z_height_start[closest_id-1,0])
+                #     this_z_height_start=z_height_start[closest_id-1,1]+ratio*(z_height_start[closest_id,1]-z_height_start[closest_id-1,1])
+                this_z_height_start=np.interp(x,z_height_start[:,0],z_height_start[:,1],left=z_height_start[0,1],right=z_height_start[-1,1])
             else: # list or numpy array
                 this_z_height_start=z_height_start
 
@@ -774,11 +783,263 @@ class ScanProcess():
             else:
                 mti_pcd_noise_remove=mti_pcd
         except Exception as e:
-            print("DBSCAN failed:", e)
+            # print("DBSCAN failed:", e)
             mti_pcd_noise_remove=None
 
         return mti_pcd_noise_remove
+
+    def scan_denoise_thread(self,crop_min=[-40, 30],crop_max=[40, 200]):
+        self.end_denoise_thread_flag = False
+        self.raw_scan_pipe = []
+        self.scan_stamps_pipe = []
+        self.clear_denoised_scan_data()
+        duration = []
+        while not self.end_denoise_thread_flag:
+            if len(self.raw_scan_pipe)!=0:
+                time_start = time.time()
+                scan_data = self.raw_scan_pipe.pop(0)
+                stamp = self.scan_stamps_pipe.pop(0)
+                scan_noise_remove = self.scan2dDenoise(scan_data.T, crop_min=crop_min, crop_max=crop_max)
+                if scan_noise_remove is not None:
+                    self.denoise_stamps.append(stamp)
+                    self.denoise_scans.append(scan_noise_remove)
+
+                duration.append(time.time()-time_start)
+            else:
+                time.sleep(0.0000000000001)
+        print("Denoise thread duration:",np.mean(duration))
+        print("Denoise thread duration max:",np.max(duration))
     
+    def get_denoised_scan_data(self):
+        try:
+            if len(self.denoise_scans)==0:
+                return None,None
+            else:
+                return deepcopy(self.denoise_scans), deepcopy(self.denoise_stamps)
+        except Exception as e:
+            print("Get denoised scan data error:", e)
+            return None,None
+
+    def clear_denoised_scan_data(self):
+        self.denoise_scans = []
+        self.denoise_stamps = []
+
+    def scan2dhdw_thread(self,
+                         curve_x_start,curve_x_end,
+                         crop_min, crop_max,
+                         crop_scanner_min, crop_scanner_max,
+                         last_height_profile=[],
+                         windows=1,
+                         Transz0_H=np.eye(4)):
+        '''
+        Docstring for scan2dhdw_thread
+        
+        :param curve_x_start: a float number indicating the starting x position of the curve
+        :param curve_x_end: a float number indicating the ending x position of the curve
+        :param crop_min: a (1,3) list indicating the min bound of crop box x y z
+        :param crop_max: a (1,3) list indicating the max bound of crop box x y z
+        :param crop_scanner_min: a (1,2) list indicating the min bound of crop box in scanner frame x y z
+        :param crop_scanner_max: a (1,2) list indicating the max bound of crop box in scanner frame x y z
+        :param resolution: Description
+        :param Transz0_H: Description
+        '''
+        try:
+            if self.end_denoise_thread_flag is False:
+                print("Please end denoise thread before starting scan2dhdw thread")
+                return
+        except AttributeError:
+            pass
+        
+        self.end_scan2dhdw_thread_flag = False
+        self.clear_scan2dhdw_data()
+
+        # results variables
+        curve_direction = (curve_x_end - curve_x_start)/np.abs(curve_x_end - curve_x_start) # normalize to 1 or -1
+
+        # parameters
+        crop_min = np.array(crop_min)
+        crop_max = np.array(crop_max)
+        crop_scanner_min = np.array(crop_scanner_min)
+        crop_scanner_max = np.array(crop_scanner_max)
+        Transz0_H_inv = np.linalg.inv(Transz0_H)
+
+        pcd_track = None
+        pcd_denoised_track = None
+        duration_list = []
+        duration_denoise_list = []
+
+        while not self.end_scan2dhdw_thread_flag:
+            try:
+
+                try:
+                    pkt = self.raw_scan_dhdw_pipe.get(timeout=0.05)
+                except Empty:
+                    continue
+
+                start_time = time.perf_counter()
+
+                scan_data = pkt.scan_data
+                scan_stamp = pkt.stamp
+                robot_q = pkt.robot_q
+
+                scan_data = scan_data.T
+                scan_data = np.insert(scan_data,0,np.zeros(len(scan_data[0])),axis=0) # (3, N)
+                scan_data = scan_data.T # (N, 3)
+                
+                # get robot transform
+                # robot_q = scan_js_exe.pop(0)
+                robot_q = np.array(robot_q)
+                T_scanner = self.robot.fwd(robot_q[:6],world=True)
+                T_positioner = self.positioner.fwd(robot_q[6:],world=True)
+                T_scanner_positioner = T_positioner.inv()*T_scanner
+                T_positioner_scanner = T_scanner_positioner.inv()
+                # get scan data in the positioner tcp frame
+                scan_data_positioner = np.matmul(T_scanner_positioner.R,scan_data.T).T+T_scanner_positioner.p # (N,3)
+                # do Transz0_H transformation
+                scan_data_positioner = np.matmul(Transz0_H[:3,:3],scan_data_positioner.T).T+Transz0_H[:3,3]
+                in_region = (scan_data_positioner[:,0]>=crop_min[0]) & (scan_data_positioner[:,0]<=crop_max[0]) & \
+                            (scan_data_positioner[:,1]>=crop_min[1]) & (scan_data_positioner[:,1]<=crop_max[1]) & \
+                            (scan_data_positioner[:,2]>=crop_min[2]) & (scan_data_positioner[:,2]<=crop_max[2])
+                scan_data_positioner = scan_data_positioner[in_region]
+
+                if len(scan_data_positioner)==0:
+                    continue
+                # print("Scan data points after crop:", len(scan_data_positioner))
+
+                # if still have points, do the rest
+                # DBSCAN
+                scan_data_scanner_frame = np.matmul(Transz0_H_inv[:3,:3],scan_data_positioner.T).T+Transz0_H_inv[:3,3]
+                scan_data_scanner_frame = np.matmul(T_positioner_scanner.R,scan_data_scanner_frame.T).T+T_positioner_scanner.p
+                scandenoise_start_time = time.perf_counter()
+                scan_data_scanner_frame_denoised = self.scan2dDenoise(scan_data_scanner_frame[:,1:].T,
+                                                                        crop_min=crop_scanner_min,
+                                                                        crop_max=crop_scanner_max)
+                duration_denoise_list.append(time.perf_counter() - scandenoise_start_time)
+                if scan_data_scanner_frame_denoised is None:
+                    continue
+                self.denoise_scan_dhdw.append(scan_data_scanner_frame_denoised)
+                self.denoise_scan_stamps.append(scan_stamp)
+                scan_data_scanner_frame_denoised = np.insert(scan_data_scanner_frame_denoised.T,0,np.zeros(len(scan_data_scanner_frame_denoised)),axis=0).T
+                
+                # print("Scan data points after denoise:", len(scan_data_scanner_frame_denoised))
+                scan_data_positioner_denoised = np.matmul(T_scanner_positioner.R,scan_data_scanner_frame_denoised.T).T+T_scanner_positioner.p
+                scan_data_positioner_denoised = np.matmul(Transz0_H[:3,:3],scan_data_positioner_denoised.T).T+Transz0_H[:3,3]
+
+                # find the height 10 points x position
+                highest_points_id = np.argsort(scan_data_positioner_denoised[:,-1])[-10:]
+                scan_x_positions = np.mean(scan_data_positioner_denoised[highest_points_id,0])
+                # print("Mean x of highest 10 points:", scan_x_positions)
+
+                # add to pcd
+                # pcd.points.extend(o3d.utility.Vector3dVector(scan_data_positioner))
+                # pcd_denoised.points.extend(o3d.utility.Vector3dVector(scan_data_positioner_denoised))
+
+                if len(self.pcd_arr) == 0:
+                    # pcd_arr = deepcopy(scan_data_positioner)
+                    self.pcd_arr.extend(scan_data_positioner)
+                    self.pcd_denoised_arr.extend(scan_data_positioner_denoised)
+                    pcd_track = deepcopy(scan_data_positioner)
+                    pcd_denoised_track = deepcopy(scan_data_positioner_denoised)
+                else:
+                    self.pcd_arr.extend(scan_data_positioner)
+                    self.pcd_denoised_arr.extend(scan_data_positioner_denoised)
+                    pcd_track = np.vstack((pcd_track, scan_data_positioner))
+                    pcd_denoised_track = np.vstack((pcd_denoised_track, scan_data_positioner_denoised))
+
+                # get interested region pcd for height and width calculation
+                curve_x_track = scan_x_positions - curve_direction*windows/2 if curve_direction>0 else scan_x_positions + curve_direction*windows/2
+                # curve_x_track += shift_x
+                if curve_x_track < min(curve_x_start,curve_x_end) or curve_x_track > max(curve_x_start,curve_x_end):
+                    continue
+
+                # print("Processing at x position:", curve_x_track)
+
+                # get z height for this x
+                z_min = 0
+                min_bound = (curve_x_track-windows/2, crop_min[1], crop_min[2])
+                max_bound = (curve_x_track+windows/2, crop_max[1], crop_max[2])
+                # crop using numpy array
+                
+                pcd_denoised_track_mask = (pcd_denoised_track[:,0]>=min_bound[0]) & (pcd_denoised_track[:,0]<=max_bound[0]) & \
+                                (pcd_denoised_track[:,1]>=min_bound[1]) & (pcd_denoised_track[:,1]<=max_bound[1]) & \
+                                (pcd_denoised_track[:,2]>=min_bound[2]) & (pcd_denoised_track[:,2]<=max_bound[2])
+                pcd_denoised_crop = pcd_denoised_track[pcd_denoised_track_mask]
+                
+                if len(pcd_denoised_crop) == 0:
+                    pcd_track_mask = (pcd_track[:,0]>=min_bound[0]) & (pcd_track[:,0]<=max_bound[0]) & \
+                                (pcd_track[:,1]>=min_bound[1]) & (pcd_track[:,1]<=max_bound[1]) & \
+                                (pcd_track[:,2]>=min_bound[2]) & (pcd_track[:,2]<=max_bound[2])
+                    pcd_denoised_crop = pcd_track[pcd_track_mask]
+                if len(pcd_denoised_crop) == 0:
+                    # print("No points in the crop for height calculation, skip...")
+                    continue
+                highest_10_point_mean = np.mean(np.sort(pcd_denoised_crop[:,-1])[-10:])
+                self.layer_height_track.append([curve_x_track, highest_10_point_mean])
+
+                # find previous z height from last height profile
+                z_min = crop_min[2]
+                if len(last_height_profile)>0:
+                    z_min = np.interp(curve_x_track,last_height_profile[:,0],last_height_profile[:,1],left=last_height_profile[0,1],right=last_height_profile[-1,1])
+
+                min_bound = (curve_x_track-windows/2, crop_min[1], z_min)
+                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+10)
+                pcd_track_mask = (pcd_track[:,0]>=min_bound[0]) & (pcd_track[:,0]<=max_bound[0]) & \
+                                (pcd_track[:,1]>=min_bound[1]) & (pcd_track[:,1]<=max_bound[1]) & \
+                                (pcd_track[:,2]>=min_bound[2]) & (pcd_track[:,2]<=max_bound[2])
+                pcd_track_crop = pcd_track[pcd_track_mask]
+                
+                if len(pcd_track_crop) == 0:
+                    self.layer_width_track.append([curve_x_track, 0.001])
+                else:
+                    width_y = np.max(pcd_track_crop[:,1]) - np.min(pcd_track_crop[:,1])
+                    self.layer_width_track.append([curve_x_track, width_y])
+                
+                # get rid of used points to save memory
+                pcd_track = pcd_track[pcd_track[:,0]>curve_x_track-windows/2] if curve_direction>0 else pcd_track[pcd_track[:,0]<curve_x_track+windows/2]
+                pcd_denoised_track = pcd_denoised_track[pcd_denoised_track[:,0]>curve_x_track-windows/2] if curve_direction>0 else pcd_denoised_track[pcd_denoised_track[:,0]<curve_x_track+windows/2]
+                
+                end_time = time.perf_counter()
+                duration_list.append(end_time - start_time)
+            except Exception as e:
+                continue
+
+        print("Processed {} scans,".format(len(duration_list)))
+        print("(Mean,95%,Max) processing time per scan (s):", np.mean(duration_list), np.percentile(duration_list,95), np.max(duration_list))
+        print("(Mean,95%,Max) denoise time per scan (s):", np.mean(duration_denoise_list), np.percentile(duration_denoise_list,95), np.max(duration_denoise_list))
+
+    def scan2dhdw_push_data(self, scan_data, robot_q, scan_stamps):
+        if not hasattr(self, 'end_scan2dhdw_thread_flag'):
+            print("Please start scan2dhdw thread before pushing data")
+            return
+        if self.end_scan2dhdw_thread_flag:
+            print("Please restart scan2dhdw thread before pushing data")
+            return
+        pkt = ScanPacket(scan_data=scan_data, robot_q=np.asarray(robot_q), stamp=scan_stamps)
+        self.raw_scan_dhdw_pipe.put(pkt)  # blocks if queue is full (backpressure)
+
+    def get_scan2dhdw_data(self):
+        try:
+            layer_height_profile = np.array(self.layer_height_track)
+            layer_width_profile = np.array(self.layer_width_track)
+            denoise_scan_dhdw = self.denoise_scan_dhdw
+            denoise_scan_stamps = np.array(self.denoise_scan_stamps)
+            return layer_height_profile, layer_width_profile, denoise_scan_dhdw, denoise_scan_stamps, np.array(self.pcd_arr), np.array(self.pcd_denoised_arr)
+        except Exception as e:
+            print("Get scan2dhdw data failed:", e)
+            return None, None, None, None, None, None
+
+    def clear_scan2dhdw_data(self):
+        # self.raw_scan_dhdw_pipe = []
+        # self.raw_scan_stamps_pipe = []
+        # self.robot_q_pipe = []
+        self.raw_scan_dhdw_pipe = Queue(maxsize=200)
+        self.denoise_scan_dhdw = []
+        self.denoise_scan_stamps = []
+        self.layer_height_track = []
+        self.layer_width_track = []
+        self.pcd_arr = []
+        self.pcd_denoised_arr = []
+
     def scan2dh(self,scan,robot_q,target_p,crop_min=[-10,85],crop_max=[10,100],offset_z=2.2,scanner='mti'):
         # TODO dh in different welding normal direction
 
@@ -809,23 +1070,6 @@ class ScanProcess():
         delta_h = (target_z[2]-point_location[2])
 
         return delta_h,point_location,mti_pcd_noise_remove,mti_pcd_noise_remove_tcp
-    
-    def scan_denoise_thread(self,crop_min=[-40, 30],crop_max=[40, 200]):
-        self.end_denoise_thread_flag = False
-        self.raw_scan_pipe = []
-        self.denoise_pipe = []
-        duration = []
-        while not self.end_denoise_thread_flag:
-            if len(self.raw_scan_pipe)!=0:
-                time_start = time.time()
-                scan_data = self.raw_scan_pipe.pop(0)
-                scan_noise_remove = self.scan2dDenoise(scan_data.T, crop_min=crop_min, crop_max=crop_max)
-                self.denoise_pipe.append(scan_noise_remove)
-                duration.append(time.time()-time_start)
-            else:
-                time.sleep(0.0000000000001)
-        print("Denoise thread duration:",np.mean(duration))
-        print("Denoise thread duration max:",np.max(duration))
     
     def scan2dh_thread(self,target_p,crop_min=[-40, 30],crop_max=[40, 200],offset_z=2.2,scanner='mti'):
         self.end_denoise_thread_flag = False
