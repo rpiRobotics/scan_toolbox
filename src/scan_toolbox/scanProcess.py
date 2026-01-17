@@ -960,7 +960,7 @@ class ScanProcess():
                 scan_data_positioner_denoised = np.matmul(Transz0_H[:3,:3],scan_data_positioner_denoised.T).T+Transz0_H[:3,3]
 
                 # find the height 10 points x position
-                highest_points_id = np.argsort(scan_data_positioner_denoised[:,-1])[-10:]
+                highest_points_id = np.argsort(scan_data_positioner_denoised[:,-1])[-5:]
                 scan_x_positions = np.mean(scan_data_positioner_denoised[highest_points_id,0])
                 # print("Mean x of highest 10 points:", scan_x_positions)
 
@@ -1032,8 +1032,8 @@ class ScanProcess():
                     self.layer_width_track.append([curve_x_track, width_y])
                 
                 # get rid of used points to save memory
-                pcd_track = pcd_track[pcd_track[:,0]>curve_x_track-windows/2] if curve_direction>0 else pcd_track[pcd_track[:,0]<curve_x_track+windows/2]
-                pcd_denoised_track = pcd_denoised_track[pcd_denoised_track[:,0]>curve_x_track-windows/2] if curve_direction>0 else pcd_denoised_track[pcd_denoised_track[:,0]<curve_x_track+windows/2]
+                pcd_track = pcd_track[pcd_track[:,0]>curve_x_track-windows/2-5] if curve_direction>0 else pcd_track[pcd_track[:,0]<curve_x_track+windows/2+5]
+                pcd_denoised_track = pcd_denoised_track[pcd_denoised_track[:,0]>curve_x_track-windows/2-5] if curve_direction>0 else pcd_denoised_track[pcd_denoised_track[:,0]<curve_x_track+windows/2+5]
                 
                 end_time = time.perf_counter()
                 duration_list.append(end_time - start_time)
