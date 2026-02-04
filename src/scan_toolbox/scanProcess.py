@@ -757,17 +757,23 @@ class ScanProcess():
 
         return profile_height_arr,profile_width_arr,Transz0_H
 
+    def scan2dcrop(self,scan,crop_min=[-10,85],crop_max=[10,100]):
+
+        mti_pcd=np.delete(scan,scan[1]==0,axis=1)
+        mti_pcd=np.delete(mti_pcd,mti_pcd[1]<crop_min[1],axis=1)
+        mti_pcd=np.delete(mti_pcd,mti_pcd[1]>crop_max[1],axis=1)
+        mti_pcd=np.delete(mti_pcd,mti_pcd[0]<crop_min[0],axis=1)
+        mti_pcd=np.delete(mti_pcd,mti_pcd[0]>crop_max[0],axis=1)
+        return mti_pcd
+
+    
     def scan2dDenoise(self,scan,crop_min=[-10,85],crop_max=[10,100]):
 
         dbscan = DBSCAN(eps=0.5,min_samples=20)
         # print("x min max",np.min(scan[0]),np.max(scan[0]))
         # print("y min max",np.min(scan[1]),np.max(scan[1]))
         ## remove not in interested region
-        mti_pcd=np.delete(scan,scan[1]==0,axis=1)
-        mti_pcd=np.delete(mti_pcd,mti_pcd[1]<crop_min[1],axis=1)
-        mti_pcd=np.delete(mti_pcd,mti_pcd[1]>crop_max[1],axis=1)
-        mti_pcd=np.delete(mti_pcd,mti_pcd[0]<crop_min[0],axis=1)
-        mti_pcd=np.delete(mti_pcd,mti_pcd[0]>crop_max[0],axis=1)
+        mti_pcd = self.scan2dcrop(scan,crop_min=crop_min,crop_max=crop_max)
         mti_pcd = mti_pcd.T
 
         # print("mti_pcd shape:",mti_pcd.shape)
@@ -1085,6 +1091,184 @@ class ScanProcess():
         self.pcd_arr = []
         self.pcd_denoised_arr = []
 
+    
+    
+    def scan2dhdw_init(self,crop_scanner_min, crop_scanner_max,
+                       curve_init, curve_tangent_vec_init, lambda_curve_init):
+        """
+        Docstring for scan2dhdw_init
+        
+        This is for scan process without threading.
+        Use for general shape scan to beads height and width calculation.
+
+        :param self: Description
+        :param crop_scanner_min: Description
+        :param crop_scanner_max: Description
+        :param curve: N x 3 array of curve x y z
+        :param curve_direction: N x 3 array of curve tangent vector
+        :param lambda_curve: N x 1 array of curve lambda (path length)
+        """
+        self.crop_scanner_min = np.array(crop_scanner_min)
+        self.crop_scanner_max = np.array(crop_scanner_max)
+
+        # curve track
+        self.curve_track = deepcopy(curve_init)
+        self.curve_tangent_vec = deepcopy(curve_tangent_vec_init)
+        self.lambda_track = deepcopy(lambda_curve_init)
+        self.layer_cnt_track = np.ones(len(curve_init))*-1
+        # layer height = [lambda, height]
+        self.layer_height_track_prev = np.vstack((np.linspace(0,1,len(curve_init)), np.zeros(len(curve_init))-30)).T
+        self.layer_height_track = deepcopy(self.layer_height_track_prev)
+        # layer left most and right most = [lambda, left_distance] [lambda, right_distance]
+        self.layer_left_track = []
+        self.layer_right_track = []
+
+    def scan2dhdw(self,scan,robot_q,positioner_q,
+                  torch_p, torch_tangent_vec, torch_lambda, torch_layer_cnt):
+        
+        # update tracking curve
+        if torch_layer_cnt - self.layer_cnt_track[-1]>1:
+            print("Warning: layer cnt jump detected from {} to {}".format(self.layer_cnt_track[-1], torch_layer_cnt))
+        mask = (self.lambda_track > torch_lambda) | \
+                (self.layer_cnt_track > torch_layer_cnt) 
+        self.curve_track = self.curve_track[mask]
+        self.curve_tangent_vec = self.curve_tangent_vec[mask]
+        self.lambda_track = self.lambda_track[mask]
+        self.layer_cnt_track = self.layer_cnt_track[mask]
+        self.curve_track = np.vstack((self.curve_track, torch_p))
+        self.curve_tangent_vec = np.vstack((self.curve_tangent_vec, torch_tangent_vec))
+        self.lambda_track = np.hstack((self.lambda_track, torch_lambda))
+        self.layer_cnt_track = np.hstack((self.layer_cnt_track, torch_layer_cnt))
+
+        # crop and denoise the scan
+        scan_crop = self.scan2dcrop(scan.T,crop_min=self.crop_scanner_min,crop_max=self.crop_scanner_max)
+        scan_denoised = self.scan2dDenoise(scan.T,crop_min=self.crop_scanner_min,crop_max=self.crop_scanner_max)
+        if scan_denoised is None:
+            scan_denoised = scan_crop
+        # get the scanner pose in positioner frame
+        T_positioner = self.positioner.fwd(positioner_q,world=True)
+        T_scanner = self.robot.fwd(robot_q,world=True)
+        T_scanner_positioner = T_positioner.inv()*T_scanner
+        
+        # get scan points in positioner frame
+        scan_crop = np.insert(scan_crop.T,0,np.zeros(len(scan_crop[0])),axis=0).T
+        scan_denoised = np.insert(scan_denoised.T,0,np.zeros(len(scan_denoised[0])),axis=0).T
+        scan_crop_positioner = np.matmul(T_scanner_positioner.R,scan_crop.T).T+T_scanner_positioner.p
+        scan_denoised_positioner = np.matmul(T_scanner_positioner.R,scan_denoised.T).T+T_scanner_positioner.p
+
+        def find_closest_curve_lambda_tangent(x,y):
+            closest_id = np.argmin(np.linalg.norm(self.curve_track[:,:2]-np.array([x, y]),axis=1))
+            point_lambda = self.lambda_track[closest_id]
+            point_layer_cnt = self.layer_cnt_track[closest_id]
+            point_tangent_vec = self.curve_tangent_vec[closest_id]
+            return point_lambda, point_layer_cnt, point_tangent_vec
+
+        # find the corresponding curve lambda
+        # heighest 5 points in scan denoised
+        highest_points_id = np.argsort(scan_denoised_positioner[:,-1])[-5:]
+        scan_x_pos, scan_y_pos, scan_z_pos = np.mean(scan_denoised_positioner[highest_points_id],axis=0)
+        # closest curve point
+        point_lambda, point_layer_cnt, point_tangent_vec = \
+            find_closest_curve_lambda_tangent(scan_x_pos, scan_y_pos)
+        # update the layer height track when start scanning the same layer
+        if point_layer_cnt == torch_layer_cnt:
+            self.layer_height_track_prev = deepcopy(self.layer_height_track)
+            self.layer_height_track = []
+        # update the layer height track
+        if len(self.layer_height_track)==0 or point_lambda >= self.layer_height_track[-1][0]:
+            # crop the point lower than the previous height
+            point_height_prev = np.interp(point_lambda,self.layer_height_track_prev[:,0],self.layer_height_track_prev[:,1],
+                                        left=np.min(self.layer_height_track_prev[:,1]),
+                                        right=np.max(self.layer_height_track_prev[:,1]))
+            scan_crop_positioner = scan_crop_positioner[scan_crop_positioner[:,-1]>point_height_prev]
+            scan_denoised_positioner = scan_denoised_positioner[scan_denoised_positioner[:,-1]>point_height_prev]
+            if len(scan_denoised_positioner)==0:
+                self.layer_height_track.append([point_lambda, point_height_prev])
+            else:
+                # get the new height
+                highest_5_point_mean = np.mean(scan_denoised_positioner[highest_points_id][:,-1])
+                self.layer_height_track.append([point_lambda, highest_5_point_mean])
+
+        # find the left most and right most points
+        if len(scan_crop_positioner)==0:
+            # self.layer_left_track.append([point_lambda, 0.001])
+            # self.layer_right_track.append([point_lambda, 0.001])
+            pass
+        else:
+            # project to the normal direction of tangent vector
+            tangent_vec_xy = point_tangent_vec[:2]/np.linalg.norm(point_tangent_vec[:2])
+            normal_vec_xy = np.array([tangent_vec_xy[1], tangent_vec_xy[0]])
+            projections = np.dot(scan_crop_positioner[:,:2] - np.array([scan_x_pos,scan_y_pos]), normal_vec_xy)
+            left_most_id = np.argsort(projections)[:3]
+            right_most_id = np.argsort(projections)[-3:]
+            # find the left most points distance and the corresponding lambda
+            left_x_mean = np.mean(scan_crop_positioner[left_most_id,0])
+            left_y_mean = np.mean(scan_crop_positioner[left_most_id,1])
+            left_distance = np.abs(np.mean(projections[left_most_id]))
+            left_point_lambda, _, _ = find_closest_curve_lambda_tangent(left_x_mean, left_y_mean)
+            if len(self.layer_left_track) == 0:
+                # first point
+                self.layer_left_track = np.array([[left_point_lambda, left_distance]])
+            else:
+                # check if need to adjust for lambda continuity
+                if left_point_lambda - self.layer_left_track[-1][0] < -0.8:
+                    # left point lambda just go over 0
+                    # the last point lambda should be close to 1
+                    self.layer_left_track[:,0] -= 1.0 # make it continuous
+                if left_point_lambda >= self.layer_left_track[-1][0]:
+                    # append
+                    self.layer_left_track = np.vstack((self.layer_left_track, [left_point_lambda, left_distance]))
+            if len(self.layer_right_track) == 0:
+                # first point
+                self.layer_right_track = np.array([[right_point_lambda, right_distance]])
+            # find the right most points distance and the corresponding lambda
+            right_x_mean = np.mean(scan_crop_positioner[right_most_id,0])
+            right_y_mean = np.mean(scan_crop_positioner[right_most_id,1])
+            right_distance = np.abs(np.mean(projections[right_most_id]))
+            right_point_lambda, _, _ = find_closest_curve_lambda_tangent(right_x_mean, right_y_mean)
+            if len(self.layer_right_track) == 0:
+                # first point
+                self.layer_right_track = np.array([[right_point_lambda, right_distance]])
+            else:
+                # check if need to adjust for lambda continuity
+                if right_point_lambda - self.layer_right_track[-1][0] < -0.8:
+                    # right point lambda just go over 0
+                    # the last point lambda should be close to 1
+                    self.layer_right_track[:,0] -= 1.0 # make it continuous
+                if right_point_lambda >= self.layer_right_track[-1][0]:
+                    # append
+                    self.layer_right_track = np.vstack((self.layer_right_track, [right_point_lambda, right_distance]))
+
+        # discard the points that's too old
+        self.layer_left_track = self.layer_left_track[self.layer_left_track[:,0]>=torch_lambda-0.5]
+        self.layer_right_track = self.layer_right_track[self.layer_right_track[:,0]>=torch_lambda-0.5]
+    
+    def scan2dhdw_get_dhdw(self, lambda_array):
+
+        if len(self.layer_left_track)==0 or len(self.layer_right_track)==0:
+            return None, None, None
+        
+        left_profile = np.interp(lambda_array,self.layer_left_track[:,0],self.layer_left_track[:,1]
+                                 ,left=np.nan,right=np.nan)
+        right_profile = np.interp(lambda_array,self.layer_right_track[:,0],self.layer_right_track[:,1]
+                                  ,left=np.nan,right=np.nan)
+        width_profile = left_profile + right_profile
+
+        lambda_array_height = deepcopy(lambda_array)
+        lambda_array_height[lambda_array_height<0] += 1.0
+        height_profile = np.interp(lambda_array_height,self.layer_height_track[:,0],self.layer_height_track[:,1]
+                                   ,left=np.nan,right=np.nan)
+        height_profile_prev = np.interp(lambda_array_height,self.layer_height_track_prev[:,0],self.layer_height_track_prev[:,1]
+                                   ,left=self.layer_height_track_prev[0,1],right=self.layer_height_track_prev[-1,1])
+        dh_profile = height_profile - height_profile_prev
+
+        return dh_profile, width_profile
+    
+    def scan2dhdw_get_height_prev(self, lambda_array):
+        height_profile_prev = np.interp(lambda_array,self.layer_height_track_prev[:,0],self.layer_height_track_prev[:,1]
+                                   ,left=self.layer_height_track_prev[0,1],right=self.layer_height_track_prev[-1,1])
+        return height_profile_prev
+    
     def scan2dh(self,scan,robot_q,target_p,crop_min=[-10,85],crop_max=[10,100],offset_z=2.2,scanner='mti'):
         # TODO dh in different welding normal direction
 
