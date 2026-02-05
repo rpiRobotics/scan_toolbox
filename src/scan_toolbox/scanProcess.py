@@ -4,6 +4,7 @@ from lambda_calc import *
 from general_robotics_toolbox import *
 import open3d as o3d
 from sklearn.cluster import DBSCAN
+from scipy.signal import savgol_filter
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -1126,11 +1127,25 @@ class ScanProcess():
     def scan2dhdw(self,scan,robot_q,positioner_q,
                   torch_p, torch_tangent_vec, torch_lambda, torch_layer_cnt):
         
+        """
+        Docstring for scan2dhdw
+        This is for scan process without threading.
+
+        :param self: Description
+        :param scan: N x 2 array of scan points in scanner frame y z
+        :param robot_q: array of 6, scanning robot joint angles
+        :param positioner_q: array of 2, positioner joint angles
+        :param torch_p: array of 3, current torch position x y z
+        :param torch_tangent_vec: array of 3, current torch tangent vector
+        :param torch_lambda: float, current torch lambda (path length), normalized, between 0~1
+        :param torch_layer_cnt: int, current torch layer count
+        """
+        
         # update tracking curve
         if torch_layer_cnt - self.layer_cnt_track[-1]>1:
             print("Warning: layer cnt jump detected from {} to {}".format(self.layer_cnt_track[-1], torch_layer_cnt))
         mask = (self.lambda_track > torch_lambda) | \
-                (self.layer_cnt_track > torch_layer_cnt) 
+                (self.layer_cnt_track >= torch_layer_cnt) 
         self.curve_track = self.curve_track[mask]
         self.curve_tangent_vec = self.curve_tangent_vec[mask]
         self.lambda_track = self.lambda_track[mask]
@@ -1173,7 +1188,8 @@ class ScanProcess():
         # update the layer height track when start scanning the same layer
         if point_layer_cnt == torch_layer_cnt:
             self.layer_height_track_prev = deepcopy(self.layer_height_track)
-            self.layer_height_track = []
+            self.layer_height_track[:,0] -= 1.0 # make it continuous for next layer
+            self.layer_height_track = self.layer_height_track[self.layer_height_track[:,0]>-1.0] # keep last layer height track
         # update the layer height track
         if len(self.layer_height_track)==0 or point_lambda >= self.layer_height_track[-1][0]:
             # crop the point lower than the previous height
@@ -1215,9 +1231,10 @@ class ScanProcess():
                     # left point lambda just go over 0
                     # the last point lambda should be close to 1
                     self.layer_left_track[:,0] -= 1.0 # make it continuous
-                if left_point_lambda >= self.layer_left_track[-1][0]:
-                    # append
-                    self.layer_left_track = np.vstack((self.layer_left_track, [left_point_lambda, left_distance]))
+                # Find insertion index
+                idx = np.searchsorted(self.layer_left_track[:, 0], left_point_lambda)
+                # Insert while keeping sorted
+                self.layer_left_track = np.insert(self.layer_left_track, idx, [left_point_lambda, left_distance], axis=0)
             if len(self.layer_right_track) == 0:
                 # first point
                 self.layer_right_track = np.array([[right_point_lambda, right_distance]])
@@ -1235,39 +1252,86 @@ class ScanProcess():
                     # right point lambda just go over 0
                     # the last point lambda should be close to 1
                     self.layer_right_track[:,0] -= 1.0 # make it continuous
-                if right_point_lambda >= self.layer_right_track[-1][0]:
-                    # append
-                    self.layer_right_track = np.vstack((self.layer_right_track, [right_point_lambda, right_distance]))
+                # Find insertion index
+                idx = np.searchsorted(self.layer_right_track[:, 0], right_point_lambda)
+                # Insert while keeping sorted
+                self.layer_right_track = np.insert(self.layer_right_track, idx, [right_point_lambda, right_distance], axis=0)
 
         # discard the points that's too old
         self.layer_left_track = self.layer_left_track[self.layer_left_track[:,0]>=torch_lambda-0.5]
         self.layer_right_track = self.layer_right_track[self.layer_right_track[:,0]>=torch_lambda-0.5]
     
-    def scan2dhdw_get_dhdw(self, lambda_array):
+    def scan2dhdw_get_dhdw(self, lambda_array, delta_lambda_norm = 0.00027):
+
+        # delta_lambda_norm => normalized delta lambda for interpolation, default for 0.1mm resolution scan
+        # 1 / 3600 ~= 0.00027
 
         if len(self.layer_left_track)==0 or len(self.layer_right_track)==0:
             return None, None, None
         
-        left_profile = np.interp(lambda_array,self.layer_left_track[:,0],self.layer_left_track[:,1]
+        def interp_and_smooth(profile, low=None, height=None):
+            if low is None:
+                low = profile[0,0]
+            if height is None:
+                height = profile[-1,0]
+            low = max(low, profile[0,0]) # ensure within profile range
+            height = min(height, profile[-1,0]) # ensure within profile range
+            profile_sample = np.arange(low, height, delta_lambda_norm)
+            profile_interp = np.interp(profile_sample,
+                                        profile[:,0], profile[:,1],
+                                        left=profile[0,1], right=profile[-1,1]) # no nan for left and right
+            profile_interp = savgol_filter(profile_interp, window_length=21, polyorder=3)
+            return profile_sample, profile_interp
+            
+        # smooth the profiles
+        left_profile_sample, left_profile_smooth = interp_and_smooth(self.layer_left_track,min(lambda_array)-0.1,max(lambda_array)+0.1)
+        right_profile_sample, right_profile_smooth = interp_and_smooth(self.layer_right_track,min(lambda_array)-0.1,max(lambda_array)+0.1)
+        # using the smooth ones to interp and get the value at lambda_array
+        left_profile = np.interp(lambda_array,left_profile_sample,left_profile_smooth
                                  ,left=np.nan,right=np.nan)
-        right_profile = np.interp(lambda_array,self.layer_right_track[:,0],self.layer_right_track[:,1]
+        right_profile = np.interp(lambda_array,right_profile_sample,right_profile_smooth
                                   ,left=np.nan,right=np.nan)
+
         width_profile = left_profile + right_profile
 
+        # get height profile and dh profile
         lambda_array_height = deepcopy(lambda_array)
         lambda_array_height[lambda_array_height<0] += 1.0
-        height_profile = np.interp(lambda_array_height,self.layer_height_track[:,0],self.layer_height_track[:,1]
+        height_profile_sample, height_profile_smooth = interp_and_smooth(self.layer_height_track,min(lambda_array)-0.1,max(lambda_array)+0.1)
+        height_profile_prev_sample, height_profile_prev_smooth = interp_and_smooth(self.layer_height_track_prev,min(lambda_array)-0.1,max(lambda_array)+0.1)
+        height_profile = np.interp(lambda_array_height,height_profile_sample,height_profile_smooth
                                    ,left=np.nan,right=np.nan)
-        height_profile_prev = np.interp(lambda_array_height,self.layer_height_track_prev[:,0],self.layer_height_track_prev[:,1]
-                                   ,left=self.layer_height_track_prev[0,1],right=self.layer_height_track_prev[-1,1])
+        height_profile_prev = np.interp(lambda_array_height,height_profile_prev_sample,height_profile_prev_smooth
+                                   ,left=height_profile_prev_smooth[0],right=height_profile_prev_smooth[-1])
         dh_profile = height_profile - height_profile_prev
 
         return dh_profile, width_profile
     
-    def scan2dhdw_get_height_prev(self, lambda_array):
-        height_profile_prev = np.interp(lambda_array,self.layer_height_track_prev[:,0],self.layer_height_track_prev[:,1]
-                                   ,left=self.layer_height_track_prev[0,1],right=self.layer_height_track_prev[-1,1])
+    def scan2dhdw_get_height_lambda(self, lambda_array, delta_lambda_norm = 0.00027):
+        def interp_and_smooth(profile, low=None, height=None):
+            if low is None:
+                low = profile[0,0]
+            if height is None:
+                height = profile[-1,0]
+            low = max(low, profile[0,0]) # ensure within profile range
+            height = min(height, profile[-1,0]) # ensure within profile range
+            profile_sample = np.arange(low, height, delta_lambda_norm)
+            profile_interp = np.interp(profile_sample,
+                                        profile[:,0], profile[:,1],
+                                        left=profile[0,1], right=profile[-1,1]) # no nan for left and right
+            profile_interp = savgol_filter(profile_interp, window_length=21, polyorder=3)
+            return profile_sample, profile_interp
+        if np.mean(lambda_array) > self.layer_height_track[-1,0]:
+            lambda_array -= 1.0 # previous layer
+        height_profile_prev_sample, height_profile_prev_smooth = interp_and_smooth(self.layer_height_track,min(lambda_array)-0.1,max(lambda_array)+0.1)
+        height_profile_prev = np.interp(lambda_array,height_profile_prev_sample,height_profile_prev_smooth
+                                   ,left=height_profile_prev_smooth[0],right=height_profile_prev_smooth[-1])
         return height_profile_prev
+    
+    def scan2dhdw_get_layer_height(self):
+
+        this_layer_height = self.layer_height_track[self.layer_height_track[:,0]>=0.0,1]
+        return this_layer_height
     
     def scan2dh(self,scan,robot_q,target_p,crop_min=[-10,85],crop_max=[10,100],offset_z=2.2,scanner='mti'):
         # TODO dh in different welding normal direction
