@@ -1165,9 +1165,19 @@ class ScanProcess():
         # remove nan in scan
         scan = scan[~np.isnan(scan[:,1])]
 
+        if len(scan) <= 1:
+            return
+
         # crop and denoise the scan
         scan_crop = self.scan2dcrop(scan,crop_min=self.crop_scanner_min,crop_max=self.crop_scanner_max)
         scan_denoised = self.scan2dDenoise(scan,crop_min=self.crop_scanner_min,crop_max=self.crop_scanner_max)
+
+        if len(scan_crop) <= 1:
+            return
+        if len(scan_denoised) <= 1:
+            return
+        
+
         if scan_denoised is None:
             scan_denoised = scan_crop
         # get the scanner pose in positioner frame
