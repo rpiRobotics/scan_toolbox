@@ -998,8 +998,10 @@ class ScanProcess():
 
                 # get z height for this x
                 z_min = 0
-                min_bound = (curve_x_track-windows/2, crop_min[1], crop_min[2])
-                max_bound = (curve_x_track+windows/2, crop_max[1], crop_max[2])
+                if len(last_height_profile)>0: # always use previous height as baseline if possible
+                    z_min = np.interp(curve_x_track,last_height_profile[:,0],last_height_profile[:,1],left=last_height_profile[0,1],right=last_height_profile[-1,1])
+                min_bound = (curve_x_track-windows/2, crop_min[1], z_min)
+                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+20)
                 # crop using numpy array
                 
                 pcd_denoised_track_mask = (pcd_denoised_track[:,0]>=min_bound[0]) & (pcd_denoised_track[:,0]<=max_bound[0]) & \
