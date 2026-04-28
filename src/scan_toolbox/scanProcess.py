@@ -952,7 +952,7 @@ class ScanProcess():
                 scan_data_scanner_frame = np.matmul(Transz0_H_inv[:3,:3],scan_data_positioner.T).T+Transz0_H_inv[:3,3]
                 scan_data_scanner_frame = np.matmul(T_positioner_scanner.R,scan_data_scanner_frame.T).T+T_positioner_scanner.p
                 scandenoise_start_time = time.perf_counter()
-                scan_data_scanner_frame_denoised = self.scan2dDenoise(scan_data_scanner_frame[:,1:].T,
+                scan_data_scanner_frame_denoised = self.scan2dDenoise(scan_data_scanner_frame[:,1:],
                                                                         crop_min=crop_scanner_min,
                                                                         crop_max=crop_scanner_max)
                 duration_denoise_list.append(time.perf_counter() - scandenoise_start_time)
