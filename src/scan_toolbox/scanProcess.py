@@ -862,7 +862,9 @@ class ScanProcess():
                          crop_scanner_min, crop_scanner_max,
                          last_height_profile=[],
                          windows=1,
-                         Transz0_H=np.eye(4)):
+                         Transz0_H=np.eye(4),
+                         margins=10,
+                         latency=2,):
         '''
         Docstring for scan2dhdw_thread
         
@@ -956,6 +958,7 @@ class ScanProcess():
                                                                         crop_min=crop_scanner_min,
                                                                         crop_max=crop_scanner_max)
                 duration_denoise_list.append(time.perf_counter() - scandenoise_start_time)
+                # print(scan_data_scanner_frame_denoised)
                 if scan_data_scanner_frame_denoised is None:
                     continue
                 self.denoise_scan_dhdw.append(scan_data_scanner_frame_denoised)
@@ -968,7 +971,7 @@ class ScanProcess():
 
                 # find the height 10 points x position
                 highest_points_id = np.argsort(scan_data_positioner_denoised[:,-1])[-5:]
-                scan_x_positions = np.mean(scan_data_positioner_denoised[highest_points_id,0])
+                scan_x_positions = np.nanmean(scan_data_positioner_denoised[highest_points_id,0])
                 # print("Mean x of highest 10 points:", scan_x_positions)
 
                 # add to pcd
@@ -988,20 +991,22 @@ class ScanProcess():
                     pcd_denoised_track = np.vstack((pcd_denoised_track, scan_data_positioner_denoised))
 
                 # get interested region pcd for height and width calculation
-                curve_x_track = scan_x_positions - curve_direction*windows/2 if curve_direction>0 else scan_x_positions + curve_direction*windows/2
-                # print("track x:", curve_x_track)
+                curve_x_track = scan_x_positions - curve_direction*latency
                 # curve_x_track += shift_x
-                if curve_x_track < min(curve_x_start,curve_x_end) or curve_x_track > max(curve_x_start,curve_x_end):
+                if curve_x_track < (min(curve_x_start,curve_x_end)-margins) or curve_x_track > (max(curve_x_start,curve_x_end)+margins):
                     continue
 
                 # print("Processing at x position:", curve_x_track)
 
                 # get z height for this x
-                z_min = 0
+                z_min = crop_min[2]
                 if len(last_height_profile)>0: # always use previous height as baseline if possible
                     z_min = np.interp(curve_x_track,last_height_profile[:,0],last_height_profile[:,1],left=last_height_profile[0,1],right=last_height_profile[-1,1])
+                    z_min -= 0.1
                 min_bound = (curve_x_track-windows/2, crop_min[1], z_min)
-                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+20)
+                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+60)
+                # print(min_bound,max_bound)
+                # print(pcd_denoised_track)
                 # crop using numpy array
                 
                 pcd_denoised_track_mask = (pcd_denoised_track[:,0]>=min_bound[0]) & (pcd_denoised_track[:,0]<=max_bound[0]) & \
@@ -1017,7 +1022,7 @@ class ScanProcess():
                 if len(pcd_denoised_crop) == 0:
                     # print("No points in the crop for height calculation, skip...")
                     continue
-                highest_10_point_mean = np.nanmean(np.sort(pcd_denoised_crop[:,-1])[-10:])
+                highest_10_point_mean = np.nanmean(np.sort(pcd_denoised_crop[:,-1])[-5:])
                 if np.isnan(highest_10_point_mean):
                     continue
                 self.layer_height_track.append([curve_x_track, highest_10_point_mean])
@@ -1026,16 +1031,19 @@ class ScanProcess():
                 z_min = crop_min[2]
                 if len(last_height_profile)>0:
                     z_min = np.interp(curve_x_track,last_height_profile[:,0],last_height_profile[:,1],left=last_height_profile[0,1],right=last_height_profile[-1,1])
+                    z_min -= 0.1
 
                 min_bound = (curve_x_track-windows/2, crop_min[1], z_min)
-                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+10)
+                max_bound = (curve_x_track+windows/2, crop_max[1], z_min+60)
                 pcd_track_mask = (pcd_track[:,0]>=min_bound[0]) & (pcd_track[:,0]<=max_bound[0]) & \
                                 (pcd_track[:,1]>=min_bound[1]) & (pcd_track[:,1]<=max_bound[1]) & \
                                 (pcd_track[:,2]>=min_bound[2]) & (pcd_track[:,2]<=max_bound[2])
                 pcd_track_crop = pcd_track[pcd_track_mask]
                 
                 if len(pcd_track_crop) == 0:
-                    self.layer_width_track.append([curve_x_track, 0.001])
+                    # self.layer_width_track.append([curve_x_track, 0.001])
+                    # print("No points in the crop for width calculation, skip...")
+                    continue
                 else:
                     width_y = np.max(pcd_track_crop[:,1]) - np.min(pcd_track_crop[:,1])
                     self.layer_width_track.append([curve_x_track, width_y])
